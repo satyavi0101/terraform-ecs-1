@@ -1,0 +1,183 @@
+terraform {
+  required_version = ">= 1.1"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 4.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+variable "aws_region" {
+  default     = "us-east-1"
+  type        = string
+  description = "AWS Region"
+}
+
+variable "app_name" {
+  default     = "my-webapp"
+  type        = string
+  description = "Application name prefix"
+}
+
+variable "jar_file_path" {
+  description = "Local path to the .jar file"
+  type        = string
+}
+
+variable "instance_type" {
+  default     = "t3.micro"
+  type        = string
+  description = "EC2 instance type"
+}
+
+variable "key_name" {
+  description = "EC2 Key Pair name for SSH access"
+  type        = string
+}
+
+resource "aws_s3_bucket" "app_bucket" {
+  bucket = "${var.app_name}-bucket-${random_id.bucket_id.hex}"
+  acl    = "private"
+
+  tags = {
+    Name = "${var.app_name}-bucket"
+  }
+}
+
+resource "random_id" "bucket_id" {
+  byte_length = 4
+}
+
+# Upload the local jar file to S3
+resource "aws_s3_bucket_object" "app_jar" {
+  bucket = aws_s3_bucket.app_bucket.id
+  key    = "${var.app_name}.jar"
+  source = var.jar_file_path
+  acl    = "private"
+}
+
+# IAM role and policy for EC2 to allow S3 read access
+resource "aws_iam_role" "ec2_role" {
+  name = "${var.app_name}-ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_policy" "s3_read_policy" {
+  name        = "${var.app_name}-s3-read-policy"
+  description = "Policy to allow EC2 to read from app S3 bucket"
+  policy      = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = [
+        "s3:GetObject"
+      ]
+      Effect   = "Allow"
+      Resource = "${aws_s3_bucket.app_bucket.arn}/*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "attach_s3_read_policy" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = aws_iam_policy.s3_read_policy.arn
+}
+
+resource "aws_iam_instance_profile" "ec2_instance_profile" {
+  name = "${var.app_name}-instance-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
+# Security group allowing SSH and app port 8888
+resource "aws_security_group" "ec2_sg" {
+  name        = "${var.app_name}-sg"
+  description = "Allow SSH and app traffic"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "App port 8888"
+    from_port   = 8888
+    to_port     = 8888
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description = "All outbound"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# We will use the default VPC
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_ami" "amazon_linux_2" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+}
+
+resource "aws_instance" "app_instance" {
+  ami                         = data.aws_ami.amazon_linux_2.id
+  instance_type               = var.instance_type
+  subnet_id                   = data.aws_vpc.default.subnets[0]
+  vpc_security_group_ids      = [aws_security_group.ec2_sg.id]
+  key_name                   = var.key_name
+  iam_instance_profile        = aws_iam_instance_profile.ec2_instance_profile.name
+  associate_public_ip_address = true
+
+  user_data = <<-EOF
+    #!/bin/bash
+    yum update -y
+    amazon-linux-extras install java-openjdk11 -y
+    # Download JAR from S3
+    aws s3 cp s3://${aws_s3_bucket.app_bucket.bucket}/${aws_s3_bucket_object.app_jar.key} /home/ec2-user/${var.app_name}.jar
+    # Run the jar in background, listening on port 8888
+    nohup java -jar /home/ec2-user/${var.app_name}.jar --server.port=8888 > /home/ec2-user/app.log 2>&1 &
+  EOF
+
+  tags = {
+    Name = "${var.app_name}-ec2-instance"
+  }
+}
+
+output "ec2_public_ip" {
+  description = "Public IP of EC2 instance"
+  value       = aws_instance.app_instance.public_ip
+}
+
+output "s3_bucket_name" {
+  description = "S3 bucket name containing .jar"
+  value       = aws_s3_bucket.app_bucket.bucket
+}
